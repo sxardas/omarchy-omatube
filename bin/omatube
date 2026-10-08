@@ -1,0 +1,328 @@
+#!/bin/bash
+
+# OmaTube helper: everything the widget runs outside QML.
+#
+#   omatube check                         installed tools, as JSON.
+#   omatube update-check                  newest yt-dlp in the Arch repos, as JSON.
+#   omatube update                        upgrade yt-dlp with pacman (run in a terminal).
+#   omatube download [options] -- URL     one video; runs inside its systemd unit.
+#       --quality best|1080|720|480|audio
+#       --staging DIR                     scratch folder, must be inside .omatube.cache.
+#       --dir DIR                         where the finished file goes.
+#       --cookies BROWSER                 retry with its cookies on a bot check.
+#   omatube playlist [options] -- URL    playlist title and entries, as one JSON line.
+#       --cookies BROWSER                 retry with its cookies on a bot check.
+#       --limit N                         only the first N videos (0: all).
+#   omatube cleanup                       ExecStopPost: delete $OMATUBE_STAGING.
+#   omatube sweep DIR                     stop leftover units, empty DIR/.omatube.cache.
+#   omatube prune PATH...                 the paths that no longer exist, as JSON.
+#
+# The widget reads `download` line by line: OMATUBE_ITEM, OMATUBE_PROGRESS,
+# OMATUBE_EXISTS, OMATUBE_FILE and yt-dlp's own ERROR: lines.
+
+set -euo pipefail
+
+CACHE_NAME=".omatube.cache"
+BOT_CHECK="not a bot|HTTP Error 403"
+# yt-dlp's warnings for a cut-down (360p-only) format list.
+PARTIAL_FORMATS="formats have been skipped|challenge solving failed|Only images are available"
+
+die() {
+  echo "ERROR: $*"
+  exit 1
+}
+
+print_error() {
+  grep '^ERROR' "$1" || tail -n1 "$1"
+}
+
+bool() {
+  if command -v "$1" >/dev/null 2>&1; then echo true; else echo false; fi
+}
+
+# yt-dlp format args. res:N caps the shorter side (a vertical Short is
+# 1080p); the width cap keeps a wide 1440p film out of 1080p.
+format_args() {
+  local width
+  case "$1" in
+    best) echo "-S res,fps,ext:mp4:m4a" ;;
+    1080 | 720 | 480)
+      width=$(( ($1 * 16 / 9) * 2048 / 1920 ))
+      echo "-f bv*[width<=?$width]+ba/b[width<=?$width]/bv*+ba/b -S res:$1,fps,ext:mp4:m4a"
+      ;;
+    # The original stream, never re-encoded: m4a when there is one, else opus.
+    audio) echo "-f ba -S ext:m4a" ;;
+    *) die "unknown quality: $1" ;;
+  esac
+}
+
+# The real quality as YouTube names it ("1080p"), snapped to a YouTube step
+# when the note is not a resolution; "audio" without video.
+QUALITY_LABEL='
+  def step($w; $h):
+    ([([$w, $h] | min), (([$w, $h] | max) * 9 / 16)] | max) as $r
+    | [144, 240, 360, 480, 720, 1080, 1440, 2160, 4320] | min_by(. - $r | length);
+  ([.requested_formats[]? | select((.vcodec // "none") != "none")] | first)
+    // (if (.vcodec // "none") != "none" then . else null end)
+  | if . == null then "audio"
+    elif ((.format_note // "") | test("^[0-9]+p")) then ((.format_note | capture("^(?<n>[0-9]+)p").n) + "p")
+    elif (.width != null and .height != null) then (step(.width; .height) | tostring) + "p"
+    else "audio"
+    end'
+
+cmd_check() {
+  local version
+  version=$(yt-dlp --version 2>/dev/null || true)
+  jq -nc --arg ytdlp "$version" --argjson ffmpeg "$(bool ffmpeg)" --argjson deno "$(bool deno)" \
+    '{ytdlp: $ytdlp, ffmpeg: $ffmpeg, deno: $deno}'
+}
+
+# The Arch package, not GitHub: only what pacman can install matters.
+cmd_update_check() {
+  local installed latest
+  installed=$(pacman -Q yt-dlp 2>/dev/null | awk '{print $2}')
+  if [[ -z $installed ]]; then
+    jq -nc '{error: "yt-dlp is not installed with pacman"}'
+    return
+  fi
+  if ! latest=$(curl -fsS --max-time 15 https://archlinux.org/packages/extra/any/yt-dlp/json/ \
+    | jq -er '.pkgver + "-" + .pkgrel'); then
+    jq -nc '{error: "Could not reach archlinux.org"}'
+    return
+  fi
+  jq -nc --arg installed "$installed" --arg latest "$latest" \
+    --argjson available "$([[ $(vercmp "$latest" "$installed") -gt 0 ]] && echo true || echo false)" \
+    '{installed: ($installed | sub("-[0-9]+$"; "")), latest: ($latest | sub("-[0-9]+$"; "")), available: $available}'
+}
+
+cmd_update() {
+  echo "Updating yt-dlp. Arch only supports full upgrades, so this runs pacman -Syu."
+  echo
+  sudo pacman -Syu --needed yt-dlp yt-dlp-ejs
+  echo
+  echo "yt-dlp $(yt-dlp --version). Reopen the OmaTube panel to pick it up."
+  read -rsn1 -p "Press any key to close"
+}
+
+# ExecStopPost. Deletes only inside .omatube.cache, and drops an empty
+# playlist folder left by a cancel.
+cmd_cleanup() {
+  local staging=${OMATUBE_STAGING:-} dir=${OMATUBE_DIR:-}
+  [[ $staging == /*/"$CACHE_NAME"/?* && $staging != *..* ]] || exit 0
+  rm -rf -- "$staging"
+  local root=${staging%/"$CACHE_NAME"/*}
+  if [[ -n $dir && $dir == "$root"/?* && $dir != *..* ]]; then
+    rmdir -- "$dir" 2>/dev/null || true
+  fi
+}
+
+# At start every omatube unit is a previous shell's: stop them, empty the cache.
+cmd_sweep() {
+  local dir=${1:?sweep needs the download folder}
+  systemctl --user stop 'omatube-*.service' >/dev/null 2>&1 || true
+  rm -rf -- "${dir:?}/$CACHE_NAME"
+}
+
+cmd_prune() {
+  local path
+  for path in "$@"; do
+    [[ -e $path ]] || printf '%s\n' "$path"
+  done | jq -Rsc 'split("\n") | map(select(. != ""))'
+}
+
+cookie_args=()
+with_cookie_retry() {
+  local log=$1 browser=$2
+  shift 2
+  if "$@" "${cookie_args[@]}" 2>&1 | tee "$log"; then return 0; fi
+  if [[ -n $browser && ${#cookie_args[@]} -eq 0 ]] && grep -Eq "$BOT_CHECK" "$log"; then
+    echo "OmaTube: YouTube asked for a sign-in, retrying with $browser cookies"
+    cookie_args=(--cookies-from-browser "$browser")
+    "$@" "${cookie_args[@]}" 2>&1 | tee "$log"
+    return
+  fi
+  return 1
+}
+
+# Whether an existing file is this video: by the user.xdg.referrer.url xattr,
+# or by title, quality and length where xattrs are unsupported.
+same_video() {
+  local file=$1 id=$2 duration=$3 url length
+  url=$(python3 -c '
+import os, sys
+try:
+    print(os.getxattr(sys.argv[1], "user.xdg.referrer.url").decode())
+except OSError:
+    pass
+' "$file" 2>/dev/null)
+  if [[ -n $url ]]; then
+    [[ $url == *"$id"* ]]
+    return
+  fi
+  length=$(ffprobe -v error -show_entries format=duration -of csv=p=0 -- "$file" 2>/dev/null)
+  length=${length%.*}
+  [[ $length =~ ^[0-9]+$ ]] && ((duration > 0 && length - duration <= 1 && duration - length <= 1))
+}
+
+cmd_download() {
+  local quality=best staging="" dir="" cookies="" url=""
+  while (($#)); do
+    case "$1" in
+      --quality) quality=$2; shift 2 ;;
+      --staging) staging=$2; shift 2 ;;
+      --dir) dir=$2; shift 2 ;;
+      --cookies) cookies=$2; shift 2 ;;
+      --) url=${2:-}; shift $# ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n $url ]] || die "no link given"
+  [[ $staging == /*/"$CACHE_NAME"/?* ]] || die "staging must be inside $CACHE_NAME"
+  [[ $dir == /* ]] || die "the download folder must be absolute"
+  # yt-dlp creates $dir itself, so a failed playlist leaves no empty folder.
+  mkdir -p -- "$staging"
+  exec 2>&1
+
+  local -a fmt
+  read -ra fmt <<<"$(format_args "$quality")"
+
+  # 1. Metadata only: the real quality for the name, reused by step 3.
+  #    A partial format list is asked for again, twice at most.
+  fetch_info() {
+    local attempt
+    for attempt in 1 2 3; do
+      if yt-dlp -J --no-playlist "${fmt[@]}" "${cookie_args[@]}" -- "$url" \
+        >"$staging/info.json" 2>"$staging/error.log"; then
+        if ((attempt < 3)) && grep -Eq "$PARTIAL_FORMATS" "$staging/error.log"; then
+          echo "OmaTube: YouTube sent a partial format list, asking again"
+          sleep $((attempt * 2))
+          continue
+        fi
+        return 0
+      fi
+      if [[ -n $cookies && ${#cookie_args[@]} -eq 0 ]] && grep -Eq "$BOT_CHECK" "$staging/error.log"; then
+        echo "OmaTube: YouTube asked for a sign-in, retrying with $cookies cookies"
+        cookie_args=(--cookies-from-browser "$cookies")
+        continue
+      fi
+      break
+    done
+    print_error "$staging/error.log"
+    return 1
+  }
+
+  # 3. Download. .part files and the merge stay in staging; the finished
+  #    file is renamed into $dir.
+  fetch_media() {
+    PYTHONUNBUFFERED=1 with_cookie_retry "$staging/download.log" "$cookies" \
+      yt-dlp --load-info-json "$staging/info.json" --no-warnings "${fmt[@]}" \
+      --merge-output-format mp4/mkv \
+      -P "temp:$staging" -P "home:$dir" \
+      -o "%(title).180B ($label)$suffix.%(ext)s" --xattrs \
+      --newline --progress --progress-delta 0.5 \
+      --progress-template "download:OMATUBE_PROGRESS %(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s" \
+      --print "after_move:OMATUBE_FILE %(filepath)s"
+  }
+
+  fetch_info || exit 1
+
+  case "$(jq -r '.live_status // ""' "$staging/info.json")" in
+    is_live) echo "ERROR: This is a live broadcast; download it once it has ended"; exit 1 ;;
+    is_upcoming) echo "ERROR: This video has not premiered yet"; exit 1 ;;
+  esac
+
+  local id label
+  id=$(jq -r '.id' "$staging/info.json")
+  label=$(jq -r "$QUALITY_LABEL" "$staging/info.json")
+  echo "OMATUBE_ITEM $(jq -c --arg label "$label" '{
+    id, title, label: $label, duration,
+    streams: ((.requested_formats // [.]) | length)
+  }' "$staging/info.json")"
+
+  # 2. Already downloaded? Check the file yt-dlp would write; another video
+  #    with the same name gets " (2)".
+  local duration suffix="" n=1 path
+  local -a taken
+  duration=$(jq -r '.duration // 0 | floor' "$staging/info.json")
+  while ((n < 100)); do
+    path=$(yt-dlp --load-info-json "$staging/info.json" --no-warnings "${fmt[@]}" \
+      --merge-output-format mp4/mkv -P "home:$dir" \
+      -o "%(title).180B ($label)$suffix.%(ext)s" --print filename 2>/dev/null) || break
+    # Any extension: the same video may have come down as mkv before.
+    shopt -s nullglob
+    taken=("${path%.*}".*)
+    shopt -u nullglob
+    ((${#taken[@]})) || break
+    if same_video "${taken[0]}" "$id" "$duration"; then
+      echo "OMATUBE_EXISTS ${taken[0]}"
+      exit 0
+    fi
+    n=$((n + 1))
+    suffix=" ($n)"
+  done
+
+  if fetch_media; then return 0; fi
+  grep -q "HTTP Error 403" "$staging/download.log" || exit 1
+  echo "OmaTube: YouTube refused the stream (403), retrying with fresh links"
+  fetch_info || exit 1
+  fetch_media
+}
+
+cmd_playlist() {
+  local cookies="" url="" limit=0
+  while (($#)); do
+    case "$1" in
+      --cookies) cookies=$2; shift 2 ;;
+      --limit) limit=$2; shift 2 ;;
+      --) url=${2:-}; shift $# ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n $url ]] || die "no link given"
+
+  # Global, not local: the EXIT trap runs after this function has returned.
+  playlist_log=$(mktemp)
+  trap 'rm -f -- "$playlist_log"' EXIT
+  local json
+  local -a items=() cookie=()
+  [[ $limit =~ ^[0-9]+$ ]] && ((limit > 0)) && items=(--playlist-items "1:$limit")
+  until json=$(yt-dlp --flat-playlist -J --no-warnings "${items[@]}" "${cookie[@]}" -- "$url" 2>"$playlist_log"); do
+    if [[ -n $cookies && ${#cookie[@]} -eq 0 ]] && grep -Eq "$BOT_CHECK" "$playlist_log"; then
+      cookie=(--cookies-from-browser "$cookies")
+    else
+      print_error "$playlist_log"
+      exit 1
+    fi
+  done
+
+  jq -c '
+    def folder: gsub("[/\u0000]"; "_") | sub("^[.\\s]+"; "") | sub("\\s+$"; "") | .[0:120];
+    {
+      id,
+      title: (.title // "Playlist"),
+      folder: ((.title // "" | folder) as $f | if $f == "" then "Playlist " + (.id // "") else $f end),
+      entries: [
+        .entries[]? | select(.id != null)
+        | select((.title // "") | test("^\\[(Private|Deleted) video\\]$") | not)
+        | {id, title: (.title // .id), url: ("https://www.youtube.com/watch?v=" + .id)}
+      ]
+    }' <<<"$json"
+}
+
+command=${1:-}
+shift || true
+case "$command" in
+  check) cmd_check ;;
+  update-check) cmd_update_check ;;
+  update) cmd_update ;;
+  download) cmd_download "$@" ;;
+  playlist) cmd_playlist "$@" ;;
+  cleanup) cmd_cleanup ;;
+  sweep) cmd_sweep "$@" ;;
+  prune) cmd_prune "$@" ;;
+  -h | --help) sed -n '3,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  *)
+    echo "unknown command: $command" >&2
+    exit 2
+    ;;
+esac
